@@ -178,6 +178,8 @@ class RolloutConfig(BaseConfig):
 
     skip_tokenizer_init: bool = False
 
+    dp_model_parallel_size: int = 1
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

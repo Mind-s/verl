@@ -33,6 +33,7 @@ import logging
 import os
 import pickle
 import time
+import socket
 from contextlib import contextmanager
 from dataclasses import asdict
 from types import MethodType
@@ -120,6 +121,70 @@ def _check_vllm_version_for_sleep_level():
         logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
         return False
     return vs.parse(current_version) >= vs.parse(minver)
+
+def get_cluster_info():
+    import torch.distributed as dist
+    # 确保分布式环境已初始化
+    if not dist.is_initialized():
+        raise RuntimeError("Distributed environment not initialized")
+
+    world_size = dist.get_world_size()
+
+    # 获取当前节点的IP地址
+    ip_address = _get_current_node_ip()
+
+    # 收集所有rank的IP地址
+    ip_list = [None] * world_size
+    dist.all_gather_object(ip_list, ip_address)
+
+    return ip_list
+
+
+def _get_current_node_ip() -> str:
+    try:
+        # 创建一个 UDP 套接字（仅用于获取接口信息）
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 连接到一个外部地址（无需真实通信）
+            s.connect(("8.8.8.8", 80))  # Google DNS 服务器
+            local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = _get_ip_by_ifname()
+        if not local_ip:
+            # 如果失败，回退到遍历接口
+            local_ip = "127.0.0.1"
+            hostname = socket.gethostname()
+            for addr in socket.getaddrinfo(hostname, None):
+                ip = addr[4][0]
+                if not ip.startswith("::"):
+                    local_ip = ip
+                    break
+    return local_ip
+
+def _init_dp_envs(config):
+    import vllm.envs as envs
+    rank = torch.distributed.get_rank()
+    # world_size = int(config.get("rollout_world_size", 1))
+    world_size = int(os.getenv("WORLD_SIZE", "-1"))
+    tp_size = int(config.get("tensor_model_parallel_size", 1))
+    dp_size = int(config.get("dp_model_parallel_size", 1))
+
+    all_ranks = torch.arange(world_size).reshape(-1, dp_size, 1, tp_size)  # noqa
+    group_ranks = all_ranks.transpose(1, 3).reshape(-1, dp_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    ip_list = get_cluster_info()
+    for index, group_rank in enumerate(group_ranks):
+        if torch.distributed.get_rank() in group_rank:
+            os.environ["VLLM_DP_MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 1 + index)
+            os.environ["VLLM_DP_MASTER_IP"] = ip_list[group_rank[0]]
+    local_dp_rank = rank // tp_size % dp_size
+    os.environ["VLLM_DP_RANK"] = str(local_dp_rank)
+    os.environ["VLLM_DP_SIZE"] = str(dp_size)
+    os.environ["VLLM_PORT"] = os.environ["VLLM_DP_MASTER_PORT"]
+    envs.VLLM_DP_RANK = int(os.environ["VLLM_DP_RANK"])
+    envs.VLLM_DP_MASTER_IP = os.environ["VLLM_DP_MASTER_IP"]
+    envs.VLLM_DP_MASTER_PORT = int(os.environ["VLLM_DP_MASTER_PORT"])
+
+    print(f"[VLLM] using TP={tp_size}, DP={dp_size}", flush=True)
 
 
 class vLLMRollout(BaseRollout):
@@ -228,6 +293,29 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        #! patch this for npu
+        enable_infer_ep = False
+        if hasattr(config, "dp_model_parallel_size") and config.dp_model_parallel_size > 1:
+            _init_dp_envs(config)
+            enable_infer_ep = True
+
+        # patch for dsv3 torch air
+        if not config.enforce_eager:
+            torchair_graph = not config.enforce_eager
+            ascend_scheduler_config = {"enabled": True}
+            graph_batch_sizes = [config.max_num_seqs] if torchair_graph else []
+            additional_config = {
+                "torchair_graph_config": {
+                    "enabled": torchair_graph,
+                    "use_cached_graph": False,
+                    "graph_batch_sizes_init": False,
+                    "graph_batch_sizes": graph_batch_sizes,
+                },
+                "ascend_scheduler_config": ascend_scheduler_config,
+                "refresh": True,
+            }
+            engine_kwargs["additional_config"] = additional_config
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -246,7 +334,13 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
+            enable_expert_parallel=enable_infer_ep,
             seed=config.get("seed", 0),
+            # compilation_config={
+            #     # "cudagraph_capture_sizes": [1,8,16,32,64],  # 捕获多张不同size的图
+            #     "cudagraph_capture_sizes": [8, 16, 32, 64, 128, 192, 256, 384],
+            #     "cudagraph_mode": "FULL_DECODE_ONLY",
+            # },
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,

@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.py_functional import union_two_dict
 from verl.utils.torch_functional import allgather_dict_tensors
+import warnings
 
 __all__ = ["DataProto", "union_tensor_dict"]
 
@@ -956,6 +957,9 @@ class DataProto:
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
+                            if k == 'timing': # ignore different timing data
+                                warnings.warn("timing data is different between ranks! Ignored.")
+                                continue
                             assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
                         else:
                             merged_meta_info[k] = v

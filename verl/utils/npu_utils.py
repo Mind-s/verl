@@ -16,6 +16,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from contextlib import contextmanager
 
 
 # Copied from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
@@ -127,3 +128,24 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
         max_seqlen_in_batch,
         used_seqlens_in_batch,
     )
+
+
+
+_TORCH_COMPILE_FUNC = None
+
+def init_torch_compile(compile):
+    global _TORCH_COMPILE_FUNC
+    if _TORCH_COMPILE_FUNC is None:
+        _TORCH_COMPILE_FUNC = compile
+
+
+@contextmanager
+def replace_torch_compile():
+    """Context manager to temporarily replace torch.compile with a dummy function"""
+    original_compile = torch.compile  # 保存原始函数
+    torch.compile = _TORCH_COMPILE_FUNC  # 替换为自定义函数
+
+    try:
+        yield  # 执行上下文代码块
+    finally:
+        torch.compile = original_compile  # 恢复原始函数

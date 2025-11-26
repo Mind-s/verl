@@ -53,14 +53,14 @@ def model_forward_gen(vision_model: bool = False):
             model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
         batch_size, seq_len = attention_mask.shape[:2]
-        input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
+        input_ids_rmpad, packed_seq_params, packed_seq_params_core = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
         input_ids_rmpad = input_ids_rmpad.contiguous()
 
         input_args = dict(
             input_ids=input_ids_rmpad,
             attention_mask=None,
             position_ids=position_ids if not vision_model else None,  # vision models will calculate position_ids
-            packed_seq_params=packed_seq_params,
+            packed_seq_params=packed_seq_params_core,
             **model_kwargs,
         )
 
